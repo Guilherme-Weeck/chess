@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Xadrez Multiplayer via MQTT</title>
+  
+  <!-- CSS do Tabuleiro (Arquivo Local) -->
+  <link rel="stylesheet" href="css/chessboard-1.0.0.min.css">
+  
+  <style>
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+      background-color: #f4f6f8;
+    }
+    .card {
+      background: #ffffff;
+      padding: 20px 30px;
+      border-radius: 12px;
+      box-shadow: 0 4px 15px rgba(0,0,0,0.08);
+      text-align: center;
+      max-width: 450px;
+      width: 90vw;
+      margin-bottom: 15px;
+    }
+    #board {
+      width: 450px;
+      max-width: 90vw;
+    }
+    button {
+      background-color: #2563eb;
+      color: white;
+      border: none;
+      padding: 10px 18px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: 600;
+      margin-top: 10px;
+    }
+    .badge {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 12px;
+      font-size: 12px;
+      font-weight: bold;
+      color: white;
+    }
+    .connected { background-color: #10b981; }
+    .disconnected { background-color: #ef4444; }
+  </style>
+</head>
+<body>
+
+  <div class="card">
+    <h2>♟️ Xadrez Multiplayer MQTT</h2>
+    <p>Rede: <span id="network-status" class="badge disconnected">Desconectado</span></p>
+    <p>Sua cor: <strong id="player-color">-</strong></p>
+    <p>Status: <strong id="turn-status">Aguardando...</strong></p>
+    
+    <div id="room-info">
+      <p>ID da Sala: <strong id="room-id">-</strong></p>
+      <button id="copy-btn">📋 Copiar Link para Convidar</button>
+    </div>
+  </div>
+
+  <div id="board"></div>
+
+  <!-- Scripts JavaScript Locais -->
+  <script src="js/jquery-3.7.1.min.js"></script>
+  <script src="js/chessboard-1.0.0.min.js"></script>
+  <script src="js/chess.min.js"></script>
+  <script src="js/mqtt.min.js"></script>
+
+  <script>
+    const BROKER_URL = 'wss://broker.emqx.io:8084/mqtt'; 
+    const clientId = 'chess_' + Math.random().toString(16).substring(2, 8);
+    
+    let board = null;
+    let game = new Chess();
+    let client = null;
+    let playerColor = 'white'; 
+    let roomId = '';
+    let topic = '';
+
+    function initRoom() {
+      const urlParams = new URLSearchParams(window.location.search);
+      const existingRoom = urlParams.get('sala');
+
+      if (existingRoom) {
+        roomId = existingRoom;
+        playerColor = 'black';
+      } else {
+        roomId = Math.random().toString(36).substring(2, 8);
+        playerColor = 'white';
+        const newUrl = `${window.location.origin}${window.location.pathname}?sala=${roomId}`;
+        window.history.pushState({ path: newUrl }, '', newUrl);
+      }
+
+      topic = `xadrez/v1/salas/${roomId}/jogadas`;
+
+      $('#room-id').text(roomId);
+      $('#player-color').text(playerColor === 'white' ? '⚪ Brancas' : '⚫ Pretas');
+    }
+
+    function connectMQTT() {
+      client = mqtt.connect(BROKER_URL, {
+        clientId: clientId,
+        keepalive: 60,
+        clean: true
+      });
+
+      client.on('connect', () => {
+        $('#network-status').text('Conectado').removeClass('disconnected').addClass('connected');
+        client.subscribe(topic);
+      });
+
+      client.on('message', (receivedTopic, message) => {
+        if (receivedTopic === topic) {
+          const payload = JSON.parse(message.toString());
+          if (payload.sender === clientId) return;
+
+          if (payload.move) {
+            const moveResult = game.move(payload.move);
+            if (moveResult) {
+              board.position(game.fen());
+              updateStatus();
+            }
+          }
+        }
+      });
+
+      client.on('error', () => {
+        $('#network-status').text('Erro').removeClass('connected').addClass('disconnected');
+      });
+    }
+
+    function onDragStart(source, piece) {
+      if (game.game_over()) return false;
+
+      if ((playerColor === 'white' && piece.search(/^b/) !== -1) ||
+          (playerColor === 'black' && piece.search(/^w/) !== -1)) {
+        return false;
+      }
+
+      if ((game.turn() === 'w' && playerColor !== 'white') ||
+          (game.turn() === 'b' && playerColor !== 'black')) {
+        return false;
+      }
+    }
+
+    function onDrop(source, target) {
+      const move = game.move({
+        from: source,
+        to: target,
+        promotion: 'q'
+      });
+
+      if (move === null) return 'snapback';
+
+      updateStatus();
+
+      if (client && client.connected) {
+        const payload = {
+          sender: clientId,
+          move: { from: source, to: target, promotion: 'q' },
+          fen: game.fen()
+        };
+        client.publish(topic, JSON.stringify(payload));
+      }
+    }
+
+    function onSnapEnd() {
+      board.position(game.fen());
+    }
+
+    function updateStatus() {
+      let statusText = game.turn() === 'w' ? 'Vez das Brancas' : 'Vez das Pretas';
+      
+      if (game.in_checkmate()) {
+        statusText = `Xeque-mate! Vitória das ${game.turn() === 'w' ? 'Pretas' : 'Brancas'}`;
+      } else if (game.in_draw()) {
+        statusText = 'Empate!';
+      } else if (game.in_check()) {
+        statusText += ' (Xeque!)';
+      }
+      
+      $('#turn-status').text(statusText);
+    }
+
+    $(document).ready(() => {
+      initRoom();
+
+      const config = {
+        draggable: true,
+        position: 'start',
+        orientation: playerColor,
+        // Aponta para a pasta local das peças baixadas
+        pieceTheme: 'img/chesspieces/wikipedia/{piece}.png',
+        onDragStart: onDragStart,
+        onDrop: onDrop,
+        onSnapEnd: onSnapEnd
+      };
+
+      board = Chessboard('board', config);
+      connectMQTT();
+      updateStatus();
+
+      $('#copy-btn').click(() => {
+        navigator.clipboard.writeText(window.location.href).then(() => {
+          alert('Link da sala copiado!');
+        });
+      });
+    });
+  </script>
+</body>
+</html>
